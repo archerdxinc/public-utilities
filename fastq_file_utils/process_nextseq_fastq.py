@@ -17,7 +17,7 @@ import re
 import shutil
 import os
 from random import random as rand
-from tempfile import NamedTemporaryFile
+from tempfile import mkstemp
 from itertools import izip, izip_longest
 from functools import partial
 import gzip
@@ -30,7 +30,8 @@ except ImportError:
 
 # Supporting Windows sux
 if not getattr(__builtins__, "WindowsError", None):
-    class WindowsError(OSError): pass
+    class WindowsError(OSError):
+        pass
 
 
 def parse_cmdline_params(arg_list=None):
@@ -64,8 +65,8 @@ def parse_cmdline_params(arg_list=None):
     selection.add_argument("-R",
                            "--random",
                            type=int,
-                           help="Number of sequences to RANDOMLY select",
-                           default=None,
+                           help="Number of sequences to RANDOMLY select (Set to 0 to skip subsampling)",
+                           default=3000000,
                            required=False)
 
     selection.add_argument("-F",
@@ -102,7 +103,7 @@ log_status = partial(log_message, status='STATUS')
 log_error = partial(log_message, status='ERROR')
 
 
-def merge_fastqs(fastqs_to_merge, output_fastq):
+def merge_compressed_fastqs(fastqs_to_merge, output_fastq):
     with open(output_fastq, 'wb') as wfp:
         for fn in fastqs_to_merge:
             with open(fn, 'rb') as rfp:
@@ -355,14 +356,15 @@ def generate_output_sequences(input_file, file_type, include=None, exclude=None,
     return output_seqs
 
 
-def __uncompress_file(filename):
+def __decompress_file(filename):
 
-    with NamedTemporaryFile(suffix='.fastq', delete=False, dir=".") as temp_fastq:
-        with gzip.open(filename, 'rb') as f:
+    fd, temp_path = mkstemp(suffix='.fastq', dir=".")
+    with open(temp_path, 'w') as temp_fastq:  # open decompressed fastq
+        with gzip.open(filename, 'rb') as f:  # open compressed fastq
             for line in f:
                 temp_fastq.write(line)
 
-    return temp_fastq
+    return temp_fastq.name, fd
 
 
 def subsample_workflow(input_file, output_header, read2_input_file=None, include=None, exclude=None, random=None,
@@ -381,8 +383,8 @@ def subsample_workflow(input_file, output_header, read2_input_file=None, include
     :param str metrics_file: File name for metrics -- optional
     """
 
-    input_file_handle = __uncompress_file(input_file)
-    input_file = input_file_handle.name
+    r2_fd = None
+    input_file, r1_fd = __decompress_file(input_file)
 
     # this should always be either "fasta", "fastq", or "txt"
     # just "fasta" or "fastq" if "strict" flag is set in get_file_type() (default)
@@ -403,8 +405,8 @@ def subsample_workflow(input_file, output_header, read2_input_file=None, include
         
         # If reads are paired end, grab the Reverse sequences
         if read2_input_file is not None:
-            read2_input_file = __uncompress_file(read2_input_file)
-            r2_seqs = SeqIO.parse(read2_input_file.name, file_type)
+            read2_input_file, r2_fd = __decompress_file(read2_input_file)
+            r2_seqs = SeqIO.parse(read2_input_file, file_type)
              
         write_sequences_to_file(output_seqs,
                                 SeqIO.parse(input_file, file_type),
@@ -416,9 +418,10 @@ def subsample_workflow(input_file, output_header, read2_input_file=None, include
 
     # close first to make windows happy... and catch any windows errors here
     try:
-        read2_input_file.close()
-        input_file_handle.close()
-        os.unlink(read2_input_file.name)
+        if r2_fd:
+            os.close(r2_fd)
+        os.close(r1_fd)
+        os.unlink(read2_input_file)
         os.unlink(input_file)
     except WindowsError:
         log_warning(__mod_name__, "Could not clean up temp files ... Sorry about the mess")
@@ -463,8 +466,6 @@ def main(args):  # pragma: no cover
 
     opts = parse_cmdline_params(args[1:])
 
-    log_status(__mod_name__, 'Merging Lanes')
-
     # Go to the requested directory
     if not os.path.isdir(opts.directory):
         log_error(__mod_name__, "{} is not a  valid directory".format(opts.directory))
@@ -488,11 +489,13 @@ def main(args):  # pragma: no cover
     # Merge fastq groups
     merged_files = []
 
+    log_status(__mod_name__, 'Merging Lanes')
+
     for group in r1_groups + r2_groups:
         header = group[0].split(file_suffix)[0]
         merged_name = "{}{}.fastq.gz".format(header, opts.output_suffix)
 
-        merge_fastqs(group, merged_name)
+        merge_compressed_fastqs(group, merged_name)
         merged_files.append(merged_name)
 
     if opts.random or opts.fraction:
